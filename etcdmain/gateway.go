@@ -16,6 +16,8 @@ package etcdmain
 
 import (
 	"fmt"
+	"go.uber.org/zap"
+	"google.golang.org/grpc/grpclog"
 	"net"
 	"net/url"
 	"os"
@@ -24,8 +26,17 @@ import (
 	"go.etcd.io/etcd/proxy/tcpproxy"
 
 	"github.com/spf13/cobra"
-	"go.uber.org/zap"
 )
+
+type etcdCommand struct {
+	*cobra.Command
+	zl     *zap.Logger
+	gl     *grpclog.LoggerV2
+	err    error
+	cfg    *config
+	readyc chan struct{}
+	errorc chan error
+}
 
 var (
 	gatewayListenAddr            string
@@ -35,6 +46,9 @@ var (
 	gatewayInsecureDiscovery     bool
 	getewayRetryDelay            time.Duration
 	gatewayCA                    string
+	gatewayWindowsEventSource    string
+	gatewayWindowsLogDir         string
+	gatewayCommand               *etcdCommand
 )
 
 var (
@@ -51,13 +65,30 @@ func init() {
 
 // newGatewayCommand returns the cobra command for "gateway".
 func newGatewayCommand() *cobra.Command {
-	lpc := &cobra.Command{
-		Use:   "gateway <subcommand>",
-		Short: "gateway related command",
+	gatewayCommand = &etcdCommand{
+		Command: &cobra.Command{
+			Use:   "gateway <subcommand>",
+			Short: "gateway related command",
+		},
+		readyc: make(chan struct{}),
+		errorc: make(chan error),
 	}
-	lpc.AddCommand(newGatewayStartCommand())
 
-	return lpc
+	gatewayCommand.AddCommand(newGatewayStartCommand())
+
+	// todo: no checkArgs() necessary?!
+	// todo: is there a reason for the different initialization of zap in grpc_proxy and gateway?
+	//       do we rely on the initialization order (gateway.go before grpc_proxy.go) here?
+	gatewayCommand.zl, gatewayCommand.err = zap.NewProduction()
+
+	gatewayCommand.cfg = &config{
+		Windows: &windowsServiceConfig{
+			eventSource: &gatewayWindowsEventSource,
+			logFile:     &gatewayWindowsLogDir,
+		},
+	}
+
+	return gatewayCommand.Command
 }
 
 func newGatewayStartCommand() *cobra.Command {
@@ -77,6 +108,10 @@ func newGatewayStartCommand() *cobra.Command {
 
 	cmd.Flags().DurationVar(&getewayRetryDelay, "retry-delay", time.Minute, "duration of delay before retrying failed endpoints")
 
+	// windows service flags
+	cmd.Flags().StringVar(&gatewayWindowsEventSource, "windows-event-source", "etcd-gateway", "Event source name used when logging to Windows Event Log.")
+	cmd.Flags().StringVar(&gatewayWindowsLogDir, "windows-log-dir", "", "Log directory used when writing log files on windows. If specified, Windows Event Log will not be used.")
+
 	return &cmd
 }
 
@@ -92,8 +127,7 @@ func stripSchema(eps []string) []string {
 }
 
 func startGateway(cmd *cobra.Command, args []string) {
-	var lg *zap.Logger
-	lg, err := zap.NewProduction()
+	lg, err := gatewayCommand.zl, gatewayCommand.err
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -139,7 +173,7 @@ func startGateway(cmd *cobra.Command, args []string) {
 	}
 
 	// At this point, etcd gateway listener is initialized
-	notifySystemd(lg)
-
+	close(gatewayCommand.readyc)
 	tp.Run()
+	// note: this is different from how the grpc_proxy works...
 }

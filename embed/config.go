@@ -306,6 +306,11 @@ type Config struct {
 	// Debug is true, to enable debug level logging.
 	Debug bool `json:"debug"`
 
+	// Event source name used when logging to Windows Event Log
+	WindowsEventSource string `json:"windows-event-source"`
+	// Log directory used when writing log files on windows
+	WindowsLogDir string      `json:"windows-log-dir"`
+
 	// ZapLoggerBuilder is used to build the zap logger.
 	ZapLoggerBuilder func(*Config) error
 

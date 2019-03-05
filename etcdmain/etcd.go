@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"go.etcd.io/etcd/embed"
@@ -45,6 +46,12 @@ import (
 
 type dirType string
 
+var once sync.Once
+var cfg struct{
+	config *config
+	err error
+}
+
 var plog = capnslog.NewPackageLogger("go.etcd.io/etcd", "etcdmain")
 
 var (
@@ -53,14 +60,66 @@ var (
 	dirEmpty  = dirType("empty")
 )
 
-func startEtcdOrProxyV2() {
-	grpc.EnableTracing = false
+func start() error{
+	lg, err, stopped, errc, e := startEtcdOrProxyV2()
 
-	cfg := newConfig()
+	if err != nil{
+		return err
+	}
+
+	svcAdapter.stop = func () error {
+		e.Close()
+		return nil
+	}
+
+	close(svcAdapter.readyc)
+
+	runEtcdOrV2Proxy(lg, err, stopped, errc)
+
+	return nil
+}
+
+func getConfig() (*zap.Logger, *config, error){
+	once.Do(func () {
+		cfg.config = newConfig()
+		cfg.err = cfg.config.parse(os.Args[1:])
+	})
+
+	return cfg.config.ec.GetLogger(), cfg.config, cfg.err
+}
+
+func runEtcdOrV2Proxy(lg *zap.Logger, err error, stopped <-chan struct{}, errc <-chan error,) {
+
+	osutil.HandleInterrupts(lg)
+
+	// At this point, the initialization of etcd is done.
+	// The listeners are listening on the TCP ports and ready
+	// for accepting connections. The etcd instance should be
+	// joined with the cluster and ready to serve incoming
+	// connections.
+
+	select {
+	case lerr := <-errc:
+		// fatal out on listener errors
+		if lg != nil {
+			lg.Fatal("listener failed", zap.Error(err))
+		} else {
+			plog.Fatal(lerr)
+		}
+	case <-stopped:
+	}
+
+	osutil.Exit(0)
+}
+
+func startEtcdOrProxyV2() (*zap.Logger, error, <-chan struct{}, <-chan error, *embed.Etcd) {
+	grpc.EnableTracing = false
+	lg, cfg, err := getConfig()
+	if err != nil {
+		plog.Errorf("Failed to get config %v", err)
+	}
 	defaultInitialCluster := cfg.ec.InitialCluster
 
-	err := cfg.parse(os.Args[1:])
-	lg := cfg.ec.GetLogger()
 	if err != nil {
 		if lg != nil {
 			lg.Warn("failed to verify flags", zap.Error(err))
@@ -127,6 +186,7 @@ func startEtcdOrProxyV2() {
 
 	var stopped <-chan struct{}
 	var errc <-chan error
+	var e *embed.Etcd
 
 	which := identifyDataDirOrDie(cfg.ec.GetLogger(), cfg.ec.Dir)
 	if which != dirEmpty {
@@ -141,7 +201,7 @@ func startEtcdOrProxyV2() {
 		}
 		switch which {
 		case dirMember:
-			stopped, errc, err = startEtcd(&cfg.ec)
+			stopped, errc, err, e = startEtcd(&cfg.ec)
 		case dirProxy:
 			err = startProxy(cfg)
 		default:
@@ -157,7 +217,7 @@ func startEtcdOrProxyV2() {
 	} else {
 		shouldProxy := cfg.isProxy()
 		if !shouldProxy {
-			stopped, errc, err = startEtcd(&cfg.ec)
+			stopped, errc, err, e = startEtcd(&cfg.ec)
 			if derr, ok := err.(*etcdserver.DiscoveryError); ok && derr.Err == v2discovery.ErrFullCluster {
 				if cfg.shouldFallbackToProxy() {
 					if lg != nil {
@@ -273,42 +333,23 @@ func startEtcdOrProxyV2() {
 			plog.Fatalf("%v", err)
 		}
 	}
-
-	osutil.HandleInterrupts(lg)
-
-	// At this point, the initialization of etcd is done.
-	// The listeners are listening on the TCP ports and ready
-	// for accepting connections. The etcd instance should be
-	// joined with the cluster and ready to serve incoming
-	// connections.
-	notifySystemd(lg)
-
-	select {
-	case lerr := <-errc:
-		// fatal out on listener errors
-		if lg != nil {
-			lg.Fatal("listener failed", zap.Error(err))
-		} else {
-			plog.Fatal(lerr)
-		}
-	case <-stopped:
-	}
-
-	osutil.Exit(0)
+	return lg, err, stopped, errc, e
 }
 
 // startEtcd runs StartEtcd in addition to hooks needed for standalone etcd.
-func startEtcd(cfg *embed.Config) (<-chan struct{}, <-chan error, error) {
+func startEtcd(cfg *embed.Config) (<-chan struct{}, <-chan error, error, *embed.Etcd) {
 	e, err := embed.StartEtcd(cfg)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, err, nil
 	}
 	osutil.RegisterInterruptHandler(e.Close)
 	select {
 	case <-e.Server.ReadyNotify(): // wait for e.Server to join the cluster
 	case <-e.Server.StopNotify(): // publish aborted from 'ErrStopped'
 	}
-	return e.Server.StopNotify(), e.Err(), nil
+
+
+	return e.Server.StopNotify(), e.Err(), nil, e
 }
 
 // startProxy launches an HTTP proxy for client communication which proxies to other etcd nodes.
@@ -546,6 +587,7 @@ func startProxy(cfg *config) error {
 			mux.Handle("/", ph)
 			plog.Fatal(http.Serve(l, mux))
 		}()
+
 	}
 	return nil
 }

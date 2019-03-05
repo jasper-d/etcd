@@ -75,6 +75,11 @@ type configProxy struct {
 	FallbackJSON           string `json:"discovery-fallback"`
 }
 
+type windowsServiceConfig struct {
+	eventSource *string
+	logFile     *string
+}
+
 // config holds the config for a command line invocation of etcd
 type config struct {
 	ec           embed.Config
@@ -83,6 +88,7 @@ type config struct {
 	configFile   string
 	printVersion bool
 	ignored      []string
+	Windows      *windowsServiceConfig
 }
 
 // configFlags has the set of flags used for command line parsing a Config
@@ -104,7 +110,16 @@ func newConfig() *config {
 			ProxyWriteTimeoutMs:    5000,
 		},
 		ignored: ignored,
+		Windows: &windowsServiceConfig{},
 	}
+
+	log.Printf("Event source: %s Log dir: %s", cfg.ec.WindowsEventSource, cfg.ec.WindowsLogDir)
+
+	cfg.Windows = &windowsServiceConfig{
+		eventSource: &cfg.ec.WindowsEventSource,
+		logFile:     &cfg.ec.WindowsLogDir,
+	}
+
 	cfg.cf = configFlags{
 		flagSet: flag.NewFlagSet("etcd", flag.ContinueOnError),
 		clusterState: flags.NewSelectiveStringValue(
@@ -252,6 +267,10 @@ func newConfig() *config {
 
 	// unsafe
 	fs.BoolVar(&cfg.ec.ForceNewCluster, "force-new-cluster", false, "Force to create a new one member cluster.")
+
+	// Windows service config
+	fs.StringVar(&cfg.ec.WindowsEventSource, "windows-event-source", "etcd", "Event source name used when logging to Windows Event Log.")
+	fs.StringVar(&cfg.ec.WindowsLogDir, "windows-log-dir", "", "Log directory used when writing log files on windows. If specified, Windows Event Log will not be used.")
 
 	// ignored
 	for _, f := range cfg.ignored {

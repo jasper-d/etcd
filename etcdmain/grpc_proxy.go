@@ -40,7 +40,7 @@ import (
 	"go.etcd.io/etcd/pkg/transport"
 	"go.etcd.io/etcd/proxy/grpcproxy"
 
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/soheilhy/cmux"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
@@ -85,6 +85,11 @@ var (
 	grpcProxyEnableOrdering bool
 
 	grpcProxyDebug bool
+
+	grpcWindowsEventSource string
+	grpcWindowsLogDir      string
+
+	grpcProxyCmd           *etcdCommand
 )
 
 const defaultGRPCMaxCallSendMsgSize = 1.5 * 1024 * 1024
@@ -95,13 +100,28 @@ func init() {
 
 // newGRPCProxyCommand returns the cobra command for "grpc-proxy".
 func newGRPCProxyCommand() *cobra.Command {
-	lpc := &cobra.Command{
+	grpcProxyCmd = &etcdCommand{
+		Command: &cobra.Command{
 		Use:   "grpc-proxy <subcommand>",
 		Short: "grpc-proxy related command",
+		},
+		readyc: make(chan struct{}),
+		errorc: make(chan error),
 	}
-	lpc.AddCommand(newGRPCProxyStartCommand())
 
-	return lpc
+	grpcProxyCmd.AddCommand(newGRPCProxyStartCommand())
+
+	checkArgs()
+
+	grpcProxyCmd.zl, grpcProxyCmd.gl, grpcProxyCmd.err = getLogger()
+	grpcProxyCmd.cfg = &config{
+		Windows: &windowsServiceConfig{
+			eventSource: &grpcWindowsEventSource,
+			logFile:     &grpcWindowsLogDir,
+		},
+}
+
+	return grpcProxyCmd.Command
 }
 
 func newGRPCProxyStartCommand() *cobra.Command {
@@ -145,12 +165,14 @@ func newGRPCProxyStartCommand() *cobra.Command {
 
 	cmd.Flags().BoolVar(&grpcProxyDebug, "debug", false, "Enable debug-level logging for grpc-proxy.")
 
+	// windows service flags
+	cmd.Flags().StringVar(&grpcWindowsEventSource, "windows-event-source", "etcd-grpc-proxy", "Event source name used when logging to Windows Event Log.")
+	cmd.Flags().StringVar(&grpcWindowsLogDir, "windows-log-dir", "", "Log directory used when writing log files on windows. If specified, Windows Event Log will not be used.")
+
 	return &cmd
 }
 
-func startGRPCProxy(cmd *cobra.Command, args []string) {
-	checkArgs()
-
+func getLogger() (logger *zap.Logger, gl *grpclog.LoggerV2, err error){
 	lcfg := logutil.DefaultZapLoggerConfig
 	if grpcProxyDebug {
 		lcfg.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
@@ -158,17 +180,26 @@ func startGRPCProxy(cmd *cobra.Command, args []string) {
 	}
 
 	lg, err := lcfg.Build()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer lg.Sync()
 
+	if err == nil {
 	var gl grpclog.LoggerV2
 	gl, err = logutil.NewGRPCLoggerV2(lcfg)
+		return lg, &gl, err
+	}
+
+	return lg, nil, err
+}
+
+func startGRPCProxy(cmd *cobra.Command, args []string) {
+	lg, gl, err := grpcProxyCmd.zl, grpcProxyCmd.gl, grpcProxyCmd.err
 	if err != nil {
 		log.Fatal(err)
 	}
-	grpclog.SetLoggerV2(gl)
+
+	defer lg.Sync()
+
+
+	grpclog.SetLoggerV2(*gl)
 
 	tlsinfo := newTLS(grpcProxyListenCA, grpcProxyListenCert, grpcProxyListenKey)
 	if tlsinfo == nil && grpcProxyListenAutoTLS {
@@ -194,10 +225,9 @@ func startGRPCProxy(cmd *cobra.Command, args []string) {
 	client := mustNewClient(lg)
 
 	srvhttp, httpl := mustHTTPListener(lg, m, tlsinfo, client)
-	errc := make(chan error)
-	go func() { errc <- newGRPCProxyServer(lg, client).Serve(grpcl) }()
-	go func() { errc <- srvhttp.Serve(httpl) }()
-	go func() { errc <- m.Serve() }()
+	go func() { svcAdapter.error <- newGRPCProxyServer(lg, client).Serve(grpcl) }()
+	go func() { svcAdapter.error <- srvhttp.Serve(httpl) }()
+	go func() { svcAdapter.error <- m.Serve() }()
 	if len(grpcProxyMetricsListenAddr) > 0 {
 		mhttpl := mustMetricsListener(lg, tlsinfo)
 		go func() {
@@ -217,10 +247,9 @@ func startGRPCProxy(cmd *cobra.Command, args []string) {
 	lg.Info("started gRPC proxy", zap.String("address", grpcProxyListenAddr))
 
 	// grpc-proxy is initialized, ready to serve
-	notifySystemd(lg)
-
-	fmt.Fprintln(os.Stderr, <-errc)
-	os.Exit(1)
+	close(grpcProxyCmd.readyc)
+/*	fmt.Fprintln(os.Stderr, <-errc)
+	os.Exit(1)*/
 }
 
 func checkArgs() {
@@ -374,7 +403,6 @@ func newGRPCProxyServer(lg *zap.Logger, client *clientv3.Client) *grpc.Server {
 
 	// set zero values for metrics registered for this grpc server
 	grpc_prometheus.Register(server)
-
 	return server
 }
 

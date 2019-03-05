@@ -16,13 +16,33 @@ package etcdmain
 
 import (
 	"fmt"
+	"go.uber.org/zap"
 	"os"
 	"strings"
-
-	"github.com/coreos/go-systemd/daemon"
-	systemdutil "github.com/coreos/go-systemd/util"
-	"go.uber.org/zap"
 )
+
+const (
+	grpcCmd = "grpc-proxy"
+	gatewayCmd = "gateway"
+)
+
+func (c *etcdCommand) GetChannels() (<- chan struct{}, <- chan error){
+	return c.readyc, c.errorc
+}
+
+func (c *etcdCommand) Init() (*zap.Logger, *config, error) {
+	return c.zl, c.cfg, c.err
+}
+
+func (c *etcdCommand) Start() error {
+	return c.Execute()
+}
+
+func (c *etcdCommand) Stop() error {
+	// todo: do we need to close/stop anything here?
+	//       what about sockets/grpc client & server
+	return nil
+}
 
 func Main() {
 	checkSupportArch()
@@ -32,43 +52,29 @@ func Main() {
 		if covArgs := os.Getenv("ETCDCOV_ARGS"); len(covArgs) > 0 {
 			args := strings.Split(os.Getenv("ETCDCOV_ARGS"), "\xe7\xcd")[1:]
 			rootCmd.SetArgs(args)
-			cmd = "grpc-proxy"
+			cmd = grpcCmd
 		}
+
+		a := &abstractAdapter{}
+
 		switch cmd {
-		case "gateway", "grpc-proxy":
-			if err := rootCmd.Execute(); err != nil {
+		case grpcCmd:
+			a.cmd = grpcProxyCmd
+			break
+		case gatewayCmd:
+			a.cmd = gatewayCommand
+			break
+		}
+
+		switch cmd {
+		case grpcCmd, gatewayCmd:
+			if err := Run(a); err != nil {
 				fmt.Fprint(os.Stderr, err)
 				os.Exit(1)
 			}
-			return
 		}
 	}
 
-	startEtcdOrProxyV2()
+	_ = Run(&abstractAdapter{svc: svcAdapter})
 }
 
-func notifySystemd(lg *zap.Logger) {
-	if !systemdutil.IsRunningSystemd() {
-		return
-	}
-
-	if lg != nil {
-		lg.Info("host was booted with systemd, sends READY=1 message to init daemon")
-	}
-	sent, err := daemon.SdNotify(false, "READY=1")
-	if err != nil {
-		if lg != nil {
-			lg.Error("failed to notify systemd for readiness", zap.Error(err))
-		} else {
-			plog.Errorf("failed to notify systemd for readiness: %v", err)
-		}
-	}
-
-	if !sent {
-		if lg != nil {
-			lg.Warn("forgot to set Type=notify in systemd service file?")
-		} else {
-			plog.Errorf("forgot to set Type=notify in systemd service file?")
-		}
-	}
-}
